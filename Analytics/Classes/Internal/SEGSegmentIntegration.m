@@ -1,25 +1,13 @@
-#include <sys/sysctl.h>
-
 #import <UIKit/UIKit.h>
 #import "SEGAnalytics.h"
 #import "SEGAnalyticsUtils.h"
 #import "SEGSegmentIntegration.h"
-#import "SEGReachability.h"
 #import "SEGHTTPClient.h"
 #import "SEGStorage.h"
-#import "SEGMacros.h"
-
-#if TARGET_OS_IOS
-#import <CoreTelephony/CTCarrier.h>
-#import <CoreTelephony/CTTelephonyNetworkInfo.h>
-#endif
 
 NSString *const SEGSegmentDidSendRequestNotification = @"SegmentDidSendRequest";
 NSString *const SEGSegmentRequestDidSucceedNotification = @"SegmentRequestDidSucceed";
 NSString *const SEGSegmentRequestDidFailNotification = @"SegmentRequestDidFail";
-
-NSString *const SEGAdvertisingClassIdentifier = @"ASIdentifierManager";
-NSString *const SEGADClientClass = @"ADClient";
 
 NSString *const SEGUserIdKey = @"SEGUserId";
 NSString *const SEGQueueKey = @"SEGQueue";
@@ -29,42 +17,17 @@ NSString *const kSEGUserIdFilename = @"segmentio.userId";
 NSString *const kSEGQueueFilename = @"segmentio.queue.plist";
 NSString *const kSEGTraitsFilename = @"segmentio.traits.plist";
 
-static NSString *GetDeviceModel()
-{
-    size_t size;
-    sysctlbyname("hw.machine", NULL, &size, NULL, 0);
-    char result[size];
-    sysctlbyname("hw.machine", result, &size, NULL, 0);
-    NSString *results = [NSString stringWithCString:result encoding:NSUTF8StringEncoding];
-    return results;
-}
-
-static BOOL GetAdTrackingEnabled()
-{
-    BOOL result = NO;
-    Class advertisingManager = NSClassFromString(SEGAdvertisingClassIdentifier);
-    SEL sharedManagerSelector = NSSelectorFromString(@"sharedManager");
-    id sharedManager = ((id (*)(id, SEL))[advertisingManager methodForSelector:sharedManagerSelector])(advertisingManager, sharedManagerSelector);
-    SEL adTrackingEnabledSEL = NSSelectorFromString(@"isAdvertisingTrackingEnabled");
-    result = ((BOOL (*)(id, SEL))[sharedManager methodForSelector:adTrackingEnabledSEL])(sharedManager, adTrackingEnabledSEL);
-    return result;
-}
-
-
 @interface SEGSegmentIntegration ()
 
 @property (nonatomic, strong) NSMutableArray *queue;
-@property (nonatomic, strong) NSDictionary *_cachedStaticContext;
 @property (nonatomic, strong) NSURLSessionUploadTask *batchRequest;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier flushTaskID;
-@property (nonatomic, strong) SEGReachability *reachability;
 @property (nonatomic, strong) NSTimer *flushTimer;
 @property (nonatomic, strong) dispatch_queue_t serialQueue;
 @property (nonatomic, strong) dispatch_queue_t backgroundTaskQueue;
 @property (nonatomic, strong) NSMutableDictionary *traits;
 @property (nonatomic, assign) SEGAnalytics *analytics;
 @property (nonatomic, assign) SEGAnalyticsConfiguration *configuration;
-@property (atomic, copy) NSDictionary *referrer;
 @property (nonatomic, copy) NSString *userId;
 @property (nonatomic, strong) NSURL *apiURL;
 @property (nonatomic, strong) SEGHTTPClient *httpClient;
@@ -88,9 +51,6 @@ static BOOL GetAdTrackingEnabled()
         self.userDefaultsStorage = userDefaultsStorage;
         self.apiURL = [SEGMENT_API_BASE URLByAppendingPathComponent:@"import"];
         self.userId = [self getUserId];
-        self.reachability = [SEGReachability reachabilityWithHostname:@"google.com"];
-        [self.reachability startNotifier];
-        self.cachedStaticContext = [self staticContext];
         self.serialQueue = seg_dispatch_queue_create_specific("io.segment.analytics.segmentio", DISPATCH_QUEUE_SERIAL);
         self.backgroundTaskQueue = seg_dispatch_queue_create_specific("io.segment.analytics.backgroundTask", DISPATCH_QUEUE_SERIAL);
         self.flushTaskID = UIBackgroundTaskInvalid;
@@ -107,9 +67,6 @@ static BOOL GetAdTrackingEnabled()
             }
 #endif
         }];
-        [self dispatchBackground:^{
-            [self trackAttributionData:self.configuration.trackAttributionData];
-        }];
 
         self.flushTimer = [NSTimer timerWithTimeInterval:self.configuration.flushInterval
                                                   target:self
@@ -119,167 +76,8 @@ static BOOL GetAdTrackingEnabled()
         
         [NSRunLoop.mainRunLoop addTimer:self.flushTimer
                                 forMode:NSDefaultRunLoopMode];
-        
-
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(updateStaticContext)
-                                                     name:UIApplicationWillEnterForegroundNotification
-                                                   object:nil];
     }
     return self;
-}
-
-/*
- * There is an iOS bug that causes instances of the CTTelephonyNetworkInfo class to
- * sometimes get notifications after they have been deallocated.
- * Instead of instantiating, using, and releasing instances you * must instead retain
- * and never release them to work around the bug.
- *
- * Ref: http://stackoverflow.com/questions/14238586/coretelephony-crash
- */
-
-#if TARGET_OS_IOS
-static CTTelephonyNetworkInfo *_telephonyNetworkInfo;
-#endif
-
-- (NSDictionary *)staticContext
-{
-    NSMutableDictionary *dict = [[NSMutableDictionary alloc] init];
-
-    dict[@"library"] = @{
-        @"name" : @"analytics-ios",
-        @"version" : [SEGAnalytics version]
-    };
-
-    NSMutableDictionary *infoDictionary = [[[NSBundle mainBundle] infoDictionary] mutableCopy];
-    [infoDictionary addEntriesFromDictionary:[[NSBundle mainBundle] localizedInfoDictionary]];
-    if (infoDictionary.count) {
-        dict[@"app"] = @{
-            @"name" : infoDictionary[@"CFBundleDisplayName"] ?: @"",
-            @"version" : infoDictionary[@"CFBundleShortVersionString"] ?: @"",
-            @"build" : infoDictionary[@"CFBundleVersion"] ?: @"",
-            @"namespace" : [[NSBundle mainBundle] bundleIdentifier] ?: @"",
-        };
-    }
-
-    UIDevice *device = [UIDevice currentDevice];
-
-    dict[@"device"] = ({
-        NSMutableDictionary *dict = [[NSMutableDictionary alloc] init];
-        dict[@"manufacturer"] = @"Apple";
-        dict[@"type"] = @"ios";
-        dict[@"model"] = GetDeviceModel();
-        dict[@"id"] = [[device identifierForVendor] UUIDString];
-        dict[@"name"] = [device model];
-        if (NSClassFromString(SEGAdvertisingClassIdentifier)) {
-            dict[@"adTrackingEnabled"] = @(GetAdTrackingEnabled());
-        }
-        if (self.configuration.enableAdvertisingTracking) {
-            NSString *idfa = SEGIDFA();
-            if (idfa.length) dict[@"advertisingId"] = idfa;
-        }
-        dict;
-    });
-
-    dict[@"os"] = @{
-        @"name" : device.systemName,
-        @"version" : device.systemVersion
-    };
-
-    CGSize screenSize = [UIScreen mainScreen].bounds.size;
-    dict[@"screen"] = @{
-        @"width" : @(screenSize.width),
-        @"height" : @(screenSize.height)
-    };
-
-#if !(TARGET_IPHONE_SIMULATOR)
-    Class adClient = NSClassFromString(SEGADClientClass);
-    if (adClient) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        id sharedClient = [adClient performSelector:NSSelectorFromString(@"sharedClient")];
-#pragma clang diagnostic pop
-        void (^completionHandler)(BOOL iad) = ^(BOOL iad) {
-            if (iad) {
-                dict[@"referrer"] = @{ @"type" : @"iad" };
-            }
-        };
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        [sharedClient performSelector:NSSelectorFromString(@"determineAppInstallationAttributionWithCompletionHandler:")
-                           withObject:completionHandler];
-#pragma clang diagnostic pop
-    }
-#endif
-
-    return dict;
-}
-
-- (void)updateStaticContext
-{
-    self.cachedStaticContext = [self staticContext];
-}
-
-- (NSDictionary *)cachedStaticContext {
-    __block NSDictionary *result = nil;
-    weakify(self);
-    dispatch_sync(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        strongify(self);
-        result = self._cachedStaticContext;
-    });
-    return result;
-}
-
-- (void)setCachedStaticContext:(NSDictionary *)cachedStaticContext {
-    weakify(self);
-    dispatch_sync(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        strongify(self);
-        self._cachedStaticContext = cachedStaticContext;
-    });
-}
-
-- (NSDictionary *)liveContext
-{
-    NSMutableDictionary *context = [[NSMutableDictionary alloc] init];
-    context[@"locale"] = [NSString stringWithFormat:
-                                       @"%@-%@",
-                                       [NSLocale.currentLocale objectForKey:NSLocaleLanguageCode],
-                                       [NSLocale.currentLocale objectForKey:NSLocaleCountryCode]];
-
-    context[@"timezone"] = [[NSTimeZone localTimeZone] name];
-
-    context[@"network"] = ({
-        NSMutableDictionary *network = [[NSMutableDictionary alloc] init];
-
-        if (self.reachability.isReachable) {
-            network[@"wifi"] = @(self.reachability.isReachableViaWiFi);
-            network[@"cellular"] = @(self.reachability.isReachableViaWWAN);
-        }
-
-#if TARGET_OS_IOS
-        static dispatch_once_t networkInfoOnceToken;
-        dispatch_once(&networkInfoOnceToken, ^{
-            _telephonyNetworkInfo = [[CTTelephonyNetworkInfo alloc] init];
-        });
-
-        CTCarrier *carrier = [_telephonyNetworkInfo subscriberCellularProvider];
-        if (carrier.carrierName.length)
-            network[@"carrier"] = carrier.carrierName;
-#endif
-
-        network;
-    });
-
-    context[@"traits"] = ({
-        NSMutableDictionary *traits = [[NSMutableDictionary alloc] initWithDictionary:[self traits]];
-        traits;
-    });
-
-    if (self.referrer) {
-        context[@"referrer"] = [self.referrer copy];
-    }
-
-    return [context copy];
 }
 
 - (void)dispatchBackground:(void (^)(void))block
@@ -407,35 +205,12 @@ static CTTelephonyNetworkInfo *_telephonyNetworkInfo;
     [self enqueueAction:@"alias" dictionary:dictionary context:payload.context integrations:payload.integrations];
 }
 
-- (void)registeredForRemoteNotificationsWithDeviceToken:(NSData *)deviceToken
-{
-    NSCParameterAssert(deviceToken != nil);
-
-    const unsigned char *buffer = (const unsigned char *)[deviceToken bytes];
-    if (!buffer) {
-        return;
-    }
-    NSMutableString *token = [NSMutableString stringWithCapacity:(deviceToken.length * 2)];
-    for (NSUInteger i = 0; i < deviceToken.length; i++) {
-        [token appendString:[NSString stringWithFormat:@"%02lx", (unsigned long)buffer[i]]];
-    }
-    [self.cachedStaticContext[@"device"] setObject:[token copy] forKey:@"token"];
-}
-
 - (void)continueUserActivity:(NSUserActivity *)activity
 {
-    if ([activity.activityType isEqualToString:NSUserActivityTypeBrowsingWeb]) {
-        self.referrer = @{
-            @"url" : activity.webpageURL.absoluteString,
-        };
-    }
 }
 
 - (void)openURL:(NSURL *)url options:(NSDictionary *)options
 {
-    self.referrer = @{
-        @"url" : url.absoluteString,
-    };
 }
 
 #pragma mark - Queueing
@@ -474,13 +249,6 @@ static CTTelephonyNetworkInfo *_telephonyNetworkInfo;
 
         [payload setValue:[self integrationsDictionary:integrations] forKey:@"integrations"];
 
-        NSDictionary *staticContext = self.cachedStaticContext;
-        NSDictionary *liveContext = [self liveContext];
-        NSDictionary *customContext = context;
-        NSMutableDictionary *context = [NSMutableDictionary dictionaryWithCapacity:staticContext.count + liveContext.count + customContext.count];
-        [context addEntriesFromDictionary:staticContext];
-        [context addEntriesFromDictionary:liveContext];
-        [context addEntriesFromDictionary:customContext];
         [payload setValue:[context copy] forKey:@"context"];
 
         SEGLog(@"%@ Enqueueing action: %@", self, payload);
@@ -651,38 +419,6 @@ static CTTelephonyNetworkInfo *_telephonyNetworkInfo;
 - (void)persistQueue
 {
     [self.fileStorage setArray:[self.queue copy] forKey:kSEGQueueFilename];
-}
-
-NSString *const SEGTrackedAttributionKey = @"SEGTrackedAttributionKey";
-
-- (void)trackAttributionData:(BOOL)trackAttributionData
-{
-#if TARGET_OS_IPHONE
-    if (!trackAttributionData) {
-        return;
-    }
-
-    BOOL trackedAttribution = [[NSUserDefaults standardUserDefaults] boolForKey:SEGTrackedAttributionKey];
-    if (trackedAttribution) {
-        return;
-    }
-
-    NSDictionary *staticContext = self.cachedStaticContext;
-    NSDictionary *liveContext = [self liveContext];
-    NSMutableDictionary *context = [NSMutableDictionary dictionaryWithCapacity:staticContext.count + liveContext.count];
-    [context addEntriesFromDictionary:staticContext];
-    [context addEntriesFromDictionary:liveContext];
-
-    self.attributionRequest = [self.httpClient attributionWithWriteKey:self.configuration.writeKey forDevice:[context copy] completionHandler:^(BOOL success, NSDictionary *properties) {
-        [self dispatchBackground:^{
-            if (success) {
-                [self.analytics track:@"Install Attributed" properties:properties];
-                [[NSUserDefaults standardUserDefaults] setBool:YES forKey:SEGTrackedAttributionKey];
-            }
-            self.attributionRequest = nil;
-        }];
-    }];
-#endif
 }
 
 @end

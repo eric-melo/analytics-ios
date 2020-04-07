@@ -58,7 +58,6 @@ NS_ASSUME_NONNULL_BEGIN
 // ------------------------------------
 - (void)receivedRemoteNotification:(NSDictionary *)userInfo;
 - (void)failedToRegisterForRemoteNotificationsWithError:(NSError *)error;
-- (void)registeredForRemoteNotificationsWithDeviceToken:(NSData *)deviceToken;
 - (void)handleActionWithIdentifier:(NSString *)identifier forRemoteNotification:(NSDictionary *)userInfo;
 
 // Callbacks for app state changes

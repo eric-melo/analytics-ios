@@ -6,6 +6,8 @@
 //  Copyright © 2016 Segment. All rights reserved.
 //
 
+#include <sys/sysctl.h>
+
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import "SEGAnalyticsUtils.h"
@@ -24,6 +26,37 @@
 #import "SEGGroupPayload.h"
 #import "SEGScreenPayload.h"
 #import "SEGAliasPayload.h"
+#import "SEGReachability.h"
+#import "SEGMacros.h"
+
+#if TARGET_OS_IOS
+#import <CoreTelephony/CTCarrier.h>
+#import <CoreTelephony/CTTelephonyNetworkInfo.h>
+#endif
+
+NSString *const SEGAdvertisingClassIdentifier = @"ASIdentifierManager";
+NSString *const SEGADClientClass = @"ADClient";
+
+static NSString *GetDeviceModel()
+{
+    size_t size;
+    sysctlbyname("hw.machine", NULL, &size, NULL, 0);
+    char result[size];
+    sysctlbyname("hw.machine", result, &size, NULL, 0);
+    NSString *results = [NSString stringWithCString:result encoding:NSUTF8StringEncoding];
+    return results;
+}
+
+static BOOL GetAdTrackingEnabled()
+{
+    BOOL result = NO;
+    Class advertisingManager = NSClassFromString(SEGAdvertisingClassIdentifier);
+    SEL sharedManagerSelector = NSSelectorFromString(@"sharedManager");
+    id sharedManager = ((id (*)(id, SEL))[advertisingManager methodForSelector:sharedManagerSelector])(advertisingManager, sharedManagerSelector);
+    SEL adTrackingEnabledSEL = NSSelectorFromString(@"isAdvertisingTrackingEnabled");
+    result = ((BOOL (*)(id, SEL))[sharedManager methodForSelector:adTrackingEnabledSEL])(sharedManager, adTrackingEnabledSEL);
+    return result;
+}
 
 NSString *SEGAnalyticsIntegrationDidStart = @"io.segment.analytics.integration.did.start";
 static NSString *const SEGAnonymousIdKey = @"SEGAnonymousId";
@@ -54,6 +87,9 @@ static NSString *const SEGCachedSettingsKey = @"analytics.settings.v2.plist";
 @property (nonatomic, strong) NSURLSessionDataTask *settingsRequest;
 @property (nonatomic, strong) id<SEGStorage> userDefaultsStorage;
 @property (nonatomic, strong) id<SEGStorage> fileStorage;
+@property (nonatomic, strong) NSDictionary *_cachedStaticContext;
+@property (nonatomic, strong) SEGReachability *reachability;
+@property (atomic, copy) NSDictionary *referrer;
 
 @end
 
@@ -73,6 +109,10 @@ static NSString *const SEGCachedSettingsKey = @"analytics.settings.v2.plist";
         self.serialQueue = seg_dispatch_queue_create_specific("io.segment.analytics", DISPATCH_QUEUE_SERIAL);
         self.messageQueue = [[NSMutableArray alloc] init];
         self.httpClient = [[SEGHTTPClient alloc] initWithRequestFactory:configuration.requestFactory];
+        self.reachability = [SEGReachability reachabilityWithHostname:@"google.com"];
+        [self.reachability startNotifier];
+        self.cachedStaticContext = [self staticContext];
+
         
         self.userDefaultsStorage = [[SEGUserDefaultsStorage alloc] initWithDefaults:[NSUserDefaults standardUserDefaults] namespacePrefix:nil crypto:configuration.crypto];
         #if TARGET_OS_TV
@@ -113,6 +153,7 @@ static NSString *const SEGCachedSettingsKey = @"analytics.settings.v2.plist";
 - (void)onAppForeground:(NSNotification *)note
 {
     [self refreshSettings];
+    [self updateStaticContext];
 }
 
 
@@ -143,6 +184,153 @@ static NSString *const SEGCachedSettingsKey = @"analytics.settings.v2.plist";
     }
 }
 
+/*
+ * There is an iOS bug that causes instances of the CTTelephonyNetworkInfo class to
+ * sometimes get notifications after they have been deallocated.
+ * Instead of instantiating, using, and releasing instances you * must instead retain
+ * and never release them to work around the bug.
+ *
+ * Ref: http://stackoverflow.com/questions/14238586/coretelephony-crash
+ */
+
+#if TARGET_OS_IOS
+static CTTelephonyNetworkInfo *_telephonyNetworkInfo;
+#endif
+
+- (NSDictionary *)staticContext
+{
+    NSMutableDictionary *dict = [[NSMutableDictionary alloc] init];
+
+    dict[@"library"] = @{
+        @"name" : @"analytics-ios",
+        @"version" : [SEGAnalytics version]
+    };
+
+    NSMutableDictionary *infoDictionary = [[[NSBundle mainBundle] infoDictionary] mutableCopy];
+    [infoDictionary addEntriesFromDictionary:[[NSBundle mainBundle] localizedInfoDictionary]];
+    if (infoDictionary.count) {
+        dict[@"app"] = @{
+            @"name" : infoDictionary[@"CFBundleDisplayName"] ?: @"",
+            @"version" : infoDictionary[@"CFBundleShortVersionString"] ?: @"",
+            @"build" : infoDictionary[@"CFBundleVersion"] ?: @"",
+            @"namespace" : [[NSBundle mainBundle] bundleIdentifier] ?: @"",
+        };
+    }
+
+    UIDevice *device = [UIDevice currentDevice];
+
+    dict[@"device"] = ({
+        NSMutableDictionary *dict = [[NSMutableDictionary alloc] init];
+        dict[@"manufacturer"] = @"Apple";
+        dict[@"type"] = @"ios";
+        dict[@"model"] = GetDeviceModel();
+        dict[@"id"] = [[device identifierForVendor] UUIDString];
+        dict[@"name"] = [device model];
+        if (NSClassFromString(SEGAdvertisingClassIdentifier)) {
+            dict[@"adTrackingEnabled"] = @(GetAdTrackingEnabled());
+        }
+        if (self.configuration.enableAdvertisingTracking) {
+            NSString *idfa = SEGIDFA();
+            if (idfa.length) dict[@"advertisingId"] = idfa;
+        }
+        dict;
+    });
+
+    dict[@"os"] = @{
+        @"name" : device.systemName,
+        @"version" : device.systemVersion
+    };
+
+    CGSize screenSize = [UIScreen mainScreen].bounds.size;
+    dict[@"screen"] = @{
+        @"width" : @(screenSize.width),
+        @"height" : @(screenSize.height)
+    };
+
+#if !(TARGET_IPHONE_SIMULATOR)
+    Class adClient = NSClassFromString(SEGADClientClass);
+    if (adClient) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id sharedClient = [adClient performSelector:NSSelectorFromString(@"sharedClient")];
+#pragma clang diagnostic pop
+        void (^completionHandler)(BOOL iad) = ^(BOOL iad) {
+            if (iad) {
+                dict[@"referrer"] = @{ @"type" : @"iad" };
+            }
+        };
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        [sharedClient performSelector:NSSelectorFromString(@"determineAppInstallationAttributionWithCompletionHandler:")
+                           withObject:completionHandler];
+#pragma clang diagnostic pop
+    }
+#endif
+
+    return dict;
+}
+
+- (void)updateStaticContext
+{
+    self.cachedStaticContext = [self staticContext];
+}
+
+- (NSDictionary *)cachedStaticContext {
+    __block NSDictionary *result = nil;
+    weakify(self);
+    dispatch_sync(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        strongify(self);
+        result = self._cachedStaticContext;
+    });
+    return result;
+}
+
+- (void)setCachedStaticContext:(NSDictionary *)cachedStaticContext {
+    weakify(self);
+    dispatch_sync(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        strongify(self);
+        self._cachedStaticContext = cachedStaticContext;
+    });
+}
+
+- (NSDictionary *)liveContext
+{
+    NSMutableDictionary *context = [[NSMutableDictionary alloc] init];
+    context[@"locale"] = [NSString stringWithFormat:
+                                       @"%@-%@",
+                                       [NSLocale.currentLocale objectForKey:NSLocaleLanguageCode],
+                                       [NSLocale.currentLocale objectForKey:NSLocaleCountryCode]];
+
+    context[@"timezone"] = [[NSTimeZone localTimeZone] name];
+
+    context[@"network"] = ({
+        NSMutableDictionary *network = [[NSMutableDictionary alloc] init];
+
+        if (self.reachability.isReachable) {
+            network[@"wifi"] = @(self.reachability.isReachableViaWiFi);
+            network[@"cellular"] = @(self.reachability.isReachableViaWWAN);
+        }
+
+#if TARGET_OS_IOS
+        static dispatch_once_t networkInfoOnceToken;
+        dispatch_once(&networkInfoOnceToken, ^{
+            _telephonyNetworkInfo = [[CTTelephonyNetworkInfo alloc] init];
+        });
+
+        CTCarrier *carrier = [_telephonyNetworkInfo subscriberCellularProvider];
+        if (carrier.carrierName.length)
+            network[@"carrier"] = carrier.carrierName;
+#endif
+
+        network;
+    });
+
+    if (self.referrer) {
+        context[@"referrer"] = [self.referrer copy];
+    }
+
+    return [context copy];
+}
 
 #pragma mark - Public API
 
@@ -167,7 +355,7 @@ static NSString *const SEGCachedSettingsKey = @"analytics.settings.v2.plist";
     SEGIdentifyPayload *payload = [[SEGIdentifyPayload alloc] initWithUserId:userId
                                                                  anonymousId:anonymousId
                                                                       traits:SEGCoerceDictionary(traits)
-                                                                     context:SEGCoerceDictionary([options objectForKey:@"context"])
+                                                                     context:SEGCoerceDictionary([self fullContextWithCustomContext:[options objectForKey:@"context"]])
                                                                 integrations:[options objectForKey:@"integrations"]];
 
     [self callIntegrationsWithSelector:NSSelectorFromString(@"identify:")
@@ -184,7 +372,7 @@ static NSString *const SEGCachedSettingsKey = @"analytics.settings.v2.plist";
 
     SEGTrackPayload *payload = [[SEGTrackPayload alloc] initWithEvent:event
                                                            properties:SEGCoerceDictionary(properties)
-                                                              context:SEGCoerceDictionary([options objectForKey:@"context"])
+                                                              context:SEGCoerceDictionary([self fullContextWithCustomContext:[options objectForKey:@"context"]])
                                                          integrations:[options objectForKey:@"integrations"]];
 
     [self callIntegrationsWithSelector:NSSelectorFromString(@"track:")
@@ -201,7 +389,7 @@ static NSString *const SEGCachedSettingsKey = @"analytics.settings.v2.plist";
 
     SEGScreenPayload *payload = [[SEGScreenPayload alloc] initWithName:screenTitle
                                                             properties:SEGCoerceDictionary(properties)
-                                                               context:SEGCoerceDictionary([options objectForKey:@"context"])
+                                                               context:SEGCoerceDictionary([self fullContextWithCustomContext:[options objectForKey:@"context"]])
                                                           integrations:[options objectForKey:@"integrations"]];
 
     [self callIntegrationsWithSelector:NSSelectorFromString(@"screen:")
@@ -216,7 +404,7 @@ static NSString *const SEGCachedSettingsKey = @"analytics.settings.v2.plist";
 {
     SEGGroupPayload *payload = [[SEGGroupPayload alloc] initWithGroupId:groupId
                                                                  traits:SEGCoerceDictionary(traits)
-                                                                context:SEGCoerceDictionary([options objectForKey:@"context"])
+                                                                context:SEGCoerceDictionary([self fullContextWithCustomContext:[options objectForKey:@"context"]])
                                                            integrations:[options objectForKey:@"integrations"]];
 
     [self callIntegrationsWithSelector:NSSelectorFromString(@"group:")
@@ -230,7 +418,7 @@ static NSString *const SEGCachedSettingsKey = @"analytics.settings.v2.plist";
 - (void)alias:(NSString *)newId options:(NSDictionary *)options
 {
     SEGAliasPayload *payload = [[SEGAliasPayload alloc] initWithNewId:newId
-                                                              context:SEGCoerceDictionary([options objectForKey:@"context"])
+                                                              context:SEGCoerceDictionary([self fullContextWithCustomContext:[options objectForKey:@"context"]])
                                                          integrations:[options objectForKey:@"integrations"]];
 
     [self callIntegrationsWithSelector:NSSelectorFromString(@"alias:")
@@ -253,7 +441,15 @@ static NSString *const SEGCachedSettingsKey = @"analytics.settings.v2.plist";
 {
     NSParameterAssert(deviceToken != nil);
 
-    [self callIntegrationsWithSelector:_cmd arguments:@[ deviceToken ] options:nil sync:true];
+    const unsigned char *buffer = (const unsigned char *)[deviceToken bytes];
+    if (!buffer) {
+        return;
+    }
+    NSMutableString *token = [NSMutableString stringWithCapacity:(deviceToken.length * 2)];
+    for (NSUInteger i = 0; i < deviceToken.length; i++) {
+        [token appendString:[NSString stringWithFormat:@"%02lx", (unsigned long)buffer[i]]];
+    }
+    [self.cachedStaticContext[@"device"] setObject:[token copy] forKey:@"token"];
 }
 
 - (void)handleActionWithIdentifier:(NSString *)identifier forRemoteNotification:(NSDictionary *)userInfo
@@ -264,11 +460,19 @@ static NSString *const SEGCachedSettingsKey = @"analytics.settings.v2.plist";
 - (void)continueUserActivity:(NSUserActivity *)activity
 {
     [self callIntegrationsWithSelector:_cmd arguments:@[ activity ] options:nil sync:true];
+    if ([activity.activityType isEqualToString:NSUserActivityTypeBrowsingWeb]) {
+        self.referrer = @{
+            @"url" : activity.webpageURL.absoluteString,
+        };
+    }
 }
 
 - (void)openURL:(NSURL *)url options:(NSDictionary *)options
 {
     [self callIntegrationsWithSelector:_cmd arguments:@[ url, options ] options:nil sync:true];
+    self.referrer = @{
+        @"url" : url.absoluteString,
+    };
 }
 
 - (void)reset
@@ -368,6 +572,7 @@ static NSString *const SEGCachedSettingsKey = @"analytics.settings.v2.plist";
             NSDictionary *integrationSettings = [projectSettings objectForKey:key];
             if (integrationSettings) {
                 id<SEGIntegration> integration = [factory createWithSettings:integrationSettings forAnalytics:self.analytics];
+                [self trackAttributionData:self.configuration.trackAttributionData];
                 if (integration != nil) {
                     self.integrations[key] = integration;
                     self.registeredIntegrations[key] = @NO;
@@ -545,6 +750,48 @@ static NSString *const SEGCachedSettingsKey = @"analytics.settings.v2.plist";
             [self queueSelector:selector arguments:arguments options:options];
         }
     });
+}
+
+- (NSDictionary *)fullContextWithCustomContext:(NSDictionary *)customContext {
+    NSDictionary *staticContext = self.cachedStaticContext;
+    NSDictionary *liveContext = [self liveContext];
+    NSMutableDictionary *context = [NSMutableDictionary dictionaryWithCapacity:staticContext.count + liveContext.count + customContext.count];
+    [context addEntriesFromDictionary:staticContext];
+    [context addEntriesFromDictionary:liveContext];
+    [context addEntriesFromDictionary:customContext];
+    return context;
+}
+
+NSString *const SEGTrackedAttributionKey = @"SEGTrackedAttributionKey";
+
+- (void)trackAttributionData:(BOOL)trackAttributionData
+{
+#if TARGET_OS_IPHONE
+    if (!trackAttributionData) {
+        return;
+    }
+
+    BOOL trackedAttribution = [[NSUserDefaults standardUserDefaults] boolForKey:SEGTrackedAttributionKey];
+    if (trackedAttribution) {
+        return;
+    }
+
+    NSDictionary *staticContext = self.cachedStaticContext;
+    NSDictionary *liveContext = [self liveContext];
+    NSMutableDictionary *context = [NSMutableDictionary dictionaryWithCapacity:staticContext.count + liveContext.count];
+    [context addEntriesFromDictionary:staticContext];
+    [context addEntriesFromDictionary:liveContext];
+
+    __block NSURLSessionDataTask *attributionRequest = [self.httpClient attributionWithWriteKey:self.configuration.writeKey forDevice:[context copy] completionHandler:^(BOOL success, NSDictionary *properties) {
+        seg_dispatch_specific_async(_serialQueue, ^{
+            if (success) {
+                [self.analytics track:@"Install Attributed" properties:properties];
+                [[NSUserDefaults standardUserDefaults] setBool:YES forKey:SEGTrackedAttributionKey];
+            }
+            attributionRequest = nil;
+        });
+    }];
+#endif
 }
 
 @end
