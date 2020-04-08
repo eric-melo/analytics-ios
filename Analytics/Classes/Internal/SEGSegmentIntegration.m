@@ -474,13 +474,6 @@ static CTTelephonyNetworkInfo *_telephonyNetworkInfo;
 
         [payload setValue:[self integrationsDictionary:integrations] forKey:@"integrations"];
 
-        NSDictionary *staticContext = self.cachedStaticContext;
-        NSDictionary *liveContext = [self liveContext];
-        NSDictionary *customContext = context;
-        NSMutableDictionary *context = [NSMutableDictionary dictionaryWithCapacity:staticContext.count + liveContext.count + customContext.count];
-        [context addEntriesFromDictionary:staticContext];
-        [context addEntriesFromDictionary:liveContext];
-        [context addEntriesFromDictionary:customContext];
         [payload setValue:[context copy] forKey:@"context"];
 
         SEGLog(@"%@ Enqueueing action: %@", self, payload);
